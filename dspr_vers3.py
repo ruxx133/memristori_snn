@@ -4,7 +4,7 @@ import random
 import re
 import unicodedata
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -13,8 +13,12 @@ from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
-
 from torchvision.transforms import functional as TF
+
+
+# ============================================================
+# Reproducibility / device
+# ============================================================
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -42,6 +46,10 @@ def parse_sheet_name(sheet_arg):
     except (TypeError, ValueError):
         return sheet_arg
 
+
+# ============================================================
+# DSPR extraction from cleaned Excel protocol
+# ============================================================
 
 @dataclass
 class Segment:
@@ -121,12 +129,15 @@ def classify_segment(voltage: float, note: str, v_read_nominal: float = 1.0) -> 
     is_read = (abs(voltage - v_read_nominal) < 0.25) or any(k in txt for k in read_keywords)
     if is_read:
         return "read"
+
     is_reset = (abs(voltage) < 0.15) and any(k in txt for k in reset_keywords)
     if is_reset:
         return "reset"
+
     is_set = (voltage >= 4.5) or any(k in txt for k in set_keywords)
     if is_set:
         return "set"
+
     return "other"
 
 
@@ -148,15 +159,28 @@ def segment_protocol(df: pd.DataFrame) -> List[Segment]:
         current_last = float(i[idx[-1]])
         duration = float(t[idx[-1]] - t[idx[0]])
         kind = classify_segment(voltage, note)
-        segments.append(Segment(int(sid), int(idx[0]), int(idx[-1]), voltage,
-                                float(t[idx[0]]), float(t[idx[-1]]), duration,
-                                current_median, current_last, len(idx), note, kind))
+        segments.append(
+            Segment(
+                sid=int(sid),
+                start_idx=int(idx[0]),
+                end_idx=int(idx[-1]),
+                voltage=voltage,
+                t0=float(t[idx[0]]),
+                t1=float(t[idx[-1]]),
+                duration=duration,
+                current_median=current_median,
+                current_last=current_last,
+                n=len(idx),
+                note=note,
+                kind=kind,
+            )
+        )
     return segments
 
 
 def read_conductance_from_segment(seg: Segment, v_read_nominal: float = 1.0) -> float:
     if abs(seg.voltage) < 1e-12:
-        raise ValueError("Cannot compute read conductance from zero-voltage segment.")
+        raise ValueError("Cannot compute conductance from zero-voltage segment.")
     return seg.current_median / float(seg.voltage if abs(seg.voltage) > 1e-12 else v_read_nominal)
 
 
@@ -173,7 +197,11 @@ def normalize_G(G: float, G_low: float, G_high: float) -> float:
 
 
 def estimate_kappas(segments: List[Segment], G_low: float, G_high: float) -> Tuple[float, float, float, float]:
-    set_rates, reset_rates, set_res, reset_res = [], [], [], []
+    set_rates = []
+    reset_rates = []
+    set_res = []
+    reset_res = []
+
     for a, b, c in zip(segments[:-2], segments[1:-1], segments[2:]):
         if a.kind != "read" or c.kind != "read":
             continue
@@ -182,6 +210,7 @@ def estimate_kappas(segments: List[Segment], G_low: float, G_high: float) -> Tup
         z0 = normalize_G(G0, G_low, G_high)
         z1 = normalize_G(G1, G_low, G_high)
         dt = max(float(b.duration), 1e-6)
+
         if b.kind == "set" and z1 > z0 and z0 < 0.999 and z1 < 0.999999:
             num = max(1.0 - z1, 1e-8)
             den = max(1.0 - z0, 1e-8)
@@ -210,6 +239,7 @@ def estimate_kappas(segments: List[Segment], G_low: float, G_high: float) -> Tup
         z0 = normalize_G(G0, G_low, G_high)
         z1 = normalize_G(G1, G_low, G_high)
         dt = max(float(b.duration), 1e-6)
+
         if b.kind == "set":
             zhat = 1.0 - (1.0 - z0) * math.exp(-kappa_plus * dt)
             set_res.append(z1 - zhat)
@@ -225,21 +255,36 @@ def estimate_kappas(segments: List[Segment], G_low: float, G_high: float) -> Tup
 def fit_dspr_from_xlsx(xlsx_path: str, sheet_name: Optional[str] = None) -> Tuple[DSPRParams, List[Segment]]:
     df = load_protocol_xlsx(xlsx_path, sheet_name=sheet_name)
     segments = segment_protocol(df)
+
     read_segments = [s for s in segments if s.kind == "read" and abs(s.voltage) > 1e-12]
     if len(read_segments) < 4:
         raise ValueError("Need several read segments to estimate G_low/G_high.")
+
     read_G = np.array([read_conductance_from_segment(s) for s in read_segments], dtype=np.float64)
     G_low, G_high = robust_plateaus(read_G)
     kappa_plus, kappa_zero, sigma_plus, sigma_zero = estimate_kappas(segments, G_low, G_high)
+
     V_read_values = [s.voltage for s in read_segments]
     V_set_values = [s.voltage for s in segments if s.kind == "set"]
     V_reset_values = [s.voltage for s in segments if s.kind == "reset"]
-    params = DSPRParams(G_low, G_high, kappa_plus, kappa_zero, sigma_plus, sigma_zero,
-                        float(np.median(V_read_values)) if V_read_values else 1.0,
-                        float(np.median(V_set_values)) if V_set_values else 5.0,
-                        float(np.median(V_reset_values)) if V_reset_values else 0.0)
+
+    params = DSPRParams(
+        G_low=G_low,
+        G_high=G_high,
+        kappa_plus=kappa_plus,
+        kappa_zero=kappa_zero,
+        sigma_plus=sigma_plus,
+        sigma_zero=sigma_zero,
+        V_read=float(np.median(V_read_values)) if V_read_values else 1.0,
+        V_set=float(np.median(V_set_values)) if V_set_values else 5.0,
+        V_reset=float(np.median(V_reset_values)) if V_reset_values else 0.0,
+    )
     return params, segments
 
+
+# ============================================================
+# Dataset loading
+# ============================================================
 
 def emnist_fix(x: torch.Tensor) -> torch.Tensor:
     x = torch.rot90(x, k=-1, dims=[1, 2])
@@ -247,24 +292,15 @@ def emnist_fix(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
-def build_transform(dataset_name: str, train: bool):
+def build_transform(dataset_name: str):
     name_l = dataset_name.lower()
-
-    # First priority: stability and guaranteed tensor output.
-    # Add augmentation back only after the pipeline is fully stable.
     if "emnist" in name_l:
-        return transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Lambda(emnist_fix),
-        ])
-
-    return transforms.Compose([
-        transforms.ToTensor(),
-    ])
+        return transforms.Compose([transforms.ToTensor(), transforms.Lambda(emnist_fix)])
+    return transforms.Compose([transforms.ToTensor()])
 
 
 def get_dataset(name: str, data_dir: str, train: bool):
-    tfm = build_transform(name, train)
+    tfm = build_transform(name)
     name_l = name.lower()
     try:
         if name_l == "fashionmnist":
@@ -292,42 +328,94 @@ def get_dataset(name: str, data_dir: str, train: bool):
     raise ValueError(f"Unsupported dataset: {name}")
 
 
-class FastSigmoidSpike(torch.autograd.Function):
+def safe_collate(batch):
+    xs, ys = zip(*batch)
+    xs_out = []
+    for x in xs:
+        xs_out.append(x if isinstance(x, torch.Tensor) else TF.to_tensor(x))
+    ys_out = []
+    for y in ys:
+        ys_out.append(int(y.item()) if isinstance(y, torch.Tensor) else int(y))
+    return torch.stack(xs_out, dim=0), torch.tensor(ys_out, dtype=torch.long)
+
+
+def subset_dataset(ds, subset: int):
+    if subset is None or subset <= 0 or subset >= len(ds):
+        return ds
+    return torch.utils.data.Subset(ds, range(subset))
+
+
+def make_loader(ds, batch_size: int, train: bool):
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=train,
+        drop_last=train,
+        num_workers=0,
+        pin_memory=False,
+        persistent_workers=False,
+        collate_fn=safe_collate,
+    )
+
+
+# ============================================================
+# Adaptive surrogate gradient / MPD alignment
+# ============================================================
+
+class MPDAlignedSpike(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x: torch.Tensor, slope: float):
-        ctx.save_for_backward(x)
-        ctx.slope = float(slope)
+    def forward(ctx, x: torch.Tensor, width: torch.Tensor):
+        ctx.save_for_backward(x, width)
         return (x > 0).to(x.dtype)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        (x,) = ctx.saved_tensors
-        slope = ctx.slope
-        grad = slope / (1.0 + torch.abs(slope * x)) ** 2
+        x, width = ctx.saved_tensors
+        w = torch.clamp(width, min=1e-4)
+        z = x / w
+        grad = 1.0 / (1.0 + torch.abs(z)) ** 2 / w
         return grad_output * grad, None
 
 
-def spike_fn(x: torch.Tensor, slope: float) -> torch.Tensor:
-    return FastSigmoidSpike.apply(x, slope)
+def mpd_spike_fn(x: torch.Tensor, width: torch.Tensor) -> torch.Tensor:
+    return MPDAlignedSpike.apply(x, width)
 
 
-class LearnableLIFCell(nn.Module):
-    def __init__(self, beta_init=0.90, threshold=0.6, reset="subtract", spike_slope=10.0):
+class MPDAlignedLIFCell(nn.Module):
+    """
+    Adaptive SG width on the neuron side, keeping DSPR untouched on the synapse side.
+    Width follows a simplified MPD-alignment rule inspired by:
+        kappa ~ 2 * sqrt(1 + beta^2) * gamma_bar * Vth
+    where gamma_bar is taken from the affine scale of the upstream normalization layer.
+    """
+    def __init__(self, beta_init=0.90, threshold=0.65, reset="subtract", kappa_scale=1.0,
+                 kappa_min=0.05, kappa_max=3.0):
         super().__init__()
         beta_init = float(np.clip(beta_init, 1e-4, 1.0 - 1e-4))
         rho = math.log(beta_init / (1.0 - beta_init))
         self.rho = nn.Parameter(torch.tensor(rho, dtype=torch.float32))
         self.threshold = float(threshold)
         self.reset = reset
-        self.spike_slope = float(spike_slope)
+        self.kappa_scale = float(kappa_scale)
+        self.kappa_min = float(kappa_min)
+        self.kappa_max = float(kappa_max)
+        self.last_width = None
 
     def beta(self):
         return torch.sigmoid(self.rho)
 
-    def forward(self, input_current: torch.Tensor, mem: torch.Tensor):
+    def compute_width(self, gamma_mean: torch.Tensor) -> torch.Tensor:
+        beta = self.beta()
+        width = 2.0 * torch.sqrt(1.0 + beta * beta) * gamma_mean.abs() * self.threshold * self.kappa_scale
+        width = torch.clamp(width, min=self.kappa_min, max=self.kappa_max)
+        return width
+
+    def forward(self, input_current: torch.Tensor, mem: torch.Tensor, gamma_mean: torch.Tensor):
         beta = self.beta()
         mem = beta * mem + input_current
-        spk = spike_fn(mem - self.threshold, self.spike_slope)
+        width = self.compute_width(gamma_mean)
+        self.last_width = float(width.detach().mean().item())
+        spk = mpd_spike_fn(mem - self.threshold, width)
         if self.reset == "subtract":
             mem = mem - spk * self.threshold
         elif self.reset == "zero":
@@ -346,16 +434,29 @@ class LearnableLICell(nn.Module):
         return torch.sigmoid(self.rho)
 
     def forward(self, input_current: torch.Tensor, mem: torch.Tensor):
-        beta = self.beta()
-        return beta * mem + input_current
+        return self.beta() * mem + input_current
 
+
+# ============================================================
+# DSPR memristive synapses
+# ============================================================
 
 class DSPRBase(nn.Module):
-    def __init__(self, param_shape: Tuple[int, ...], dspr: DSPRParams, wmax: float = 1.0,
-                 init_mode: str = "mid", init_spread: float = 0.03,
-                 history_lambda: float = 0.0, tau_h: float = 1.0, history_increment: float = 1.0,
-                 noise_on: bool = False, leak_dt: float = 0.0, delta_z_cap: float = 0.05,
-                 eps: float = 1e-8):
+    def __init__(
+        self,
+        param_shape: Tuple[int, ...],
+        dspr: DSPRParams,
+        wmax: float = 1.0,
+        init_mode: str = "mid",
+        init_spread: float = 0.03,
+        history_lambda: float = 0.0,
+        tau_h: float = 1.0,
+        history_increment: float = 1.0,
+        noise_on: bool = False,
+        leak_dt: float = 0.0,
+        delta_z_cap: float = 0.05,
+        eps: float = 1e-8,
+    ):
         super().__init__()
         self.wmax = float(wmax)
         self.kappa_plus = float(dspr.kappa_plus)
@@ -376,6 +477,7 @@ class DSPRBase(nn.Module):
             mean_pos, mean_neg = 0.75, 0.25
         else:
             mean_pos, mean_neg = 0.55, 0.45
+
         zpos = torch.empty(*param_shape).normal_(mean=mean_pos, std=init_spread).clamp_(0.0, 1.0)
         zneg = torch.empty(*param_shape).normal_(mean=mean_neg, std=init_spread).clamp_(0.0, 1.0)
         self.z_pos = nn.Parameter(zpos)
@@ -391,7 +493,7 @@ class DSPRBase(nn.Module):
             return torch.full_like(h, fill_value=base)
         return base * (1.0 + self.history_lambda * h)
 
-    def _apply_set(self, z: torch.Tensor, h: torch.Tensor, dz_target: torch.Tensor):
+    def _apply_set(self, z: torch.Tensor, h: torch.Tensor, dz_target: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if dz_target.max().item() <= 0.0:
             return z, h
         kappa_eff = self._kappa_eff(h, self.kappa_plus)
@@ -403,12 +505,15 @@ class DSPRBase(nn.Module):
             z_new = z_new + self.sigma_plus * torch.sqrt((1.0 - z).clamp(min=0.0)) * torch.randn_like(z)
         z_new = z_new.clamp(0.0, 1.0)
         if self.history_lambda != 0.0:
-            h_new = torch.exp(-tau / self.tau_h) * h + self.history_increment if self.tau_h > 0 else h + self.history_increment
+            if self.tau_h > 0:
+                h_new = torch.exp(-tau / self.tau_h) * h + self.history_increment
+            else:
+                h_new = h + self.history_increment
         else:
             h_new = h
         return z_new, h_new
 
-    def _apply_leak(self, z: torch.Tensor, h: torch.Tensor):
+    def _apply_leak(self, z: torch.Tensor, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.leak_dt <= 0.0:
             return z, h
         kappa_eff = self._kappa_eff(h, self.kappa_zero)
@@ -429,24 +534,29 @@ class DSPRBase(nn.Module):
         grad_w = 0.5 * (self.z_pos.grad / self.wmax - self.z_neg.grad / self.wmax)
         desired_dw = -float(eta_net) * grad_w
         desired_dz = (desired_dw.abs() / max(self.wmax, self.eps)).clamp(min=0.0, max=self.delta_z_cap)
+
         pos_mask = desired_dw > 0.0
         neg_mask = desired_dw < 0.0
+
         if pos_mask.any():
             dz_pos = torch.where(pos_mask, desired_dz, torch.zeros_like(desired_dz))
             z_new, h_new = self._apply_set(self.z_pos, self.h_pos, dz_pos)
             self.z_pos.copy_(torch.where(pos_mask, z_new, self.z_pos))
             self.h_pos.copy_(torch.where(pos_mask, h_new, self.h_pos))
+
         if neg_mask.any():
             dz_neg = torch.where(neg_mask, desired_dz, torch.zeros_like(desired_dz))
             z_new, h_new = self._apply_set(self.z_neg, self.h_neg, dz_neg)
             self.z_neg.copy_(torch.where(neg_mask, z_new, self.z_neg))
             self.h_neg.copy_(torch.where(neg_mask, h_new, self.h_neg))
+
         zpl, hpl = self._apply_leak(self.z_pos, self.h_pos)
         znl, hnl = self._apply_leak(self.z_neg, self.h_neg)
         self.z_pos.copy_(zpl.clamp(0.0, 1.0))
         self.z_neg.copy_(znl.clamp(0.0, 1.0))
         self.h_pos.copy_(hpl)
         self.h_neg.copy_(hnl)
+
         if self.z_pos.grad is not None:
             self.z_pos.grad.zero_()
         if self.z_neg.grad is not None:
@@ -464,8 +574,8 @@ class DSPRDiffLinear(DSPRBase):
 
 
 class DSPRDiffConv2d(DSPRBase):
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int,
-                 dspr: DSPRParams, stride: int = 1, padding: int = 0, **kwargs):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, dspr: DSPRParams,
+                 stride: int = 1, padding: int = 0, **kwargs):
         self.in_channels = int(in_channels)
         self.out_channels = int(out_channels)
         self.kernel_size = int(kernel_size)
@@ -477,34 +587,62 @@ class DSPRDiffConv2d(DSPRBase):
         return F.conv2d(x, self.effective_weight(), bias=None, stride=self.stride, padding=self.padding)
 
 
-class ConvDSPRNet(nn.Module):
-    def __init__(self, n_out: int, dspr: DSPRParams,
-                 beta_h: float = 0.90, thr_h: float = 0.6, spike_slope: float = 10.0,
-                 beta_out: float = 0.92,
-                 syn_scale_conv1: float = 0.8, syn_scale_conv2: float = 0.6,
-                 syn_scale_fc1: float = 0.4, syn_scale_fc2: float = 0.35,
-                 wmax_conv1: float = 1.0, wmax_conv2: float = 1.0,
-                 wmax_fc1: float = 1.0, wmax_fc2: float = 1.0,
-                 reset_h: str = "subtract", init_mode: str = "mid", init_spread: float = 0.03,
-                 history_lambda: float = 0.0, tau_h: float = 1.0, history_increment: float = 1.0,
-                 noise_on: bool = False, leak_dt: float = 0.0, delta_z_cap: float = 0.05):
+# ============================================================
+# Conv SNN with MPD-aligned SG + DSPR synapses
+# ============================================================
+
+class ConvDSPRMPDNet(nn.Module):
+    def __init__(
+        self,
+        n_out: int,
+        dspr: DSPRParams,
+        beta_h: float = 0.90,
+        thr_h: float = 0.65,
+        beta_out: float = 0.92,
+        syn_scale_conv1: float = 0.60,
+        syn_scale_conv2: float = 0.45,
+        syn_scale_fc1: float = 0.28,
+        syn_scale_fc2: float = 0.18,
+        wmax_conv1: float = 1.0,
+        wmax_conv2: float = 1.0,
+        wmax_fc1: float = 1.0,
+        wmax_fc2: float = 1.0,
+        reset_h: str = "subtract",
+        init_mode: str = "mid",
+        init_spread: float = 0.03,
+        history_lambda: float = 0.0,
+        tau_h: float = 1.0,
+        history_increment: float = 1.0,
+        noise_on: bool = False,
+        leak_dt: float = 0.0,
+        delta_z_cap: float = 0.05,
+        kappa_scale: float = 1.0,
+    ):
         super().__init__()
-        common = dict(dspr=dspr, init_mode=init_mode, init_spread=init_spread,
-                      history_lambda=history_lambda, tau_h=tau_h,
-                      history_increment=history_increment, noise_on=noise_on,
-                      leak_dt=leak_dt, delta_z_cap=delta_z_cap)
+        common = dict(
+            dspr=dspr,
+            init_mode=init_mode,
+            init_spread=init_spread,
+            history_lambda=history_lambda,
+            tau_h=tau_h,
+            history_increment=history_increment,
+            noise_on=noise_on,
+            leak_dt=leak_dt,
+            delta_z_cap=delta_z_cap,
+        )
+
         self.conv1 = DSPRDiffConv2d(1, 32, kernel_size=3, stride=1, padding=1, wmax=wmax_conv1, **common)
         self.conv2 = DSPRDiffConv2d(32, 64, kernel_size=3, stride=1, padding=1, wmax=wmax_conv2, **common)
         self.fc1 = DSPRDiffLinear(64 * 7 * 7, 256, wmax=wmax_fc1, **common)
         self.fc2 = DSPRDiffLinear(256, n_out, wmax=wmax_fc2, **common)
 
-        self.bn1 = nn.BatchNorm2d(32)
-        self.bn2 = nn.BatchNorm2d(64)
-        self.bn3 = nn.BatchNorm1d(256)
+        self.bn1 = nn.BatchNorm2d(32, affine=True, track_running_stats=True)
+        self.bn2 = nn.BatchNorm2d(64, affine=True, track_running_stats=True)
+        self.bn3 = nn.BatchNorm1d(256, affine=True, track_running_stats=True)
 
-        self.lif1 = LearnableLIFCell(beta_init=beta_h, threshold=thr_h, reset=reset_h, spike_slope=spike_slope)
-        self.lif2 = LearnableLIFCell(beta_init=beta_h, threshold=thr_h, reset=reset_h, spike_slope=spike_slope)
-        self.lif3 = LearnableLIFCell(beta_init=beta_h, threshold=thr_h, reset=reset_h, spike_slope=spike_slope)
+        self.lif1 = MPDAlignedLIFCell(beta_init=beta_h, threshold=thr_h, reset=reset_h, kappa_scale=kappa_scale)
+        self.lif2 = MPDAlignedLIFCell(beta_init=beta_h, threshold=thr_h, reset=reset_h, kappa_scale=kappa_scale)
+        self.lif3 = MPDAlignedLIFCell(beta_init=beta_h, threshold=thr_h, reset=reset_h, kappa_scale=kappa_scale)
         self.li_out = LearnableLICell(beta_init=beta_out)
 
         self.pool = nn.MaxPool2d(2)
@@ -514,6 +652,7 @@ class ConvDSPRNet(nn.Module):
         self.syn_scale_fc2 = float(syn_scale_fc2)
         self.hidden_dim = 256
         self.n_out = int(n_out)
+        self.last_sg_stats = {}
 
     def forward(self, spk_in: torch.Tensor):
         T, B = spk_in.shape[0], spk_in.shape[1]
@@ -521,23 +660,44 @@ class ConvDSPRNet(nn.Module):
         mem2 = torch.zeros(B, 64, 14, 14, device=spk_in.device)
         mem3 = torch.zeros(B, self.hidden_dim, device=spk_in.device)
         mem_out = torch.zeros(B, self.n_out, device=spk_in.device)
+
         mem_out_rec = []
         fr_accum = 0.0
+
         for t in range(T):
             x = spk_in[t]
-            cur1 = self.bn1(self.syn_scale_conv1 * self.conv1(x))
-            spk1, mem1 = self.lif1(cur1, mem1)
+
+            cur1 = self.syn_scale_conv1 * self.conv1(x)
+            cur1 = self.bn1(cur1)
+            g1 = self.bn1.weight.abs().mean() if self.bn1.affine else torch.tensor(1.0, device=x.device)
+            spk1, mem1 = self.lif1(cur1, mem1, g1)
             x1 = self.pool(spk1)
-            cur2 = self.bn2(self.syn_scale_conv2 * self.conv2(x1))
-            spk2, mem2 = self.lif2(cur2, mem2)
-            x2 = self.pool(spk2).flatten(1)
-            cur3 = self.bn3(self.syn_scale_fc1 * self.fc1(x2))
-            spk3, mem3 = self.lif3(cur3, mem3)
+
+            cur2 = self.syn_scale_conv2 * self.conv2(x1)
+            cur2 = self.bn2(cur2)
+            g2 = self.bn2.weight.abs().mean() if self.bn2.affine else torch.tensor(1.0, device=x.device)
+            spk2, mem2 = self.lif2(cur2, mem2, g2)
+            x2 = self.pool(spk2)
+
+            x2 = x2.flatten(1)
+            cur3 = self.syn_scale_fc1 * self.fc1(x2)
+            cur3 = self.bn3(cur3)
+            g3 = self.bn3.weight.abs().mean() if self.bn3.affine else torch.tensor(1.0, device=x.device)
+            spk3, mem3 = self.lif3(cur3, mem3, g3)
+
             cur4 = self.syn_scale_fc2 * self.fc2(spk3)
             mem_out = self.li_out(cur4, mem_out)
             mem_out_rec.append(mem_out)
             fr_accum = fr_accum + spk1.mean() + spk2.mean() + spk3.mean()
-        return torch.stack(mem_out_rec), fr_accum / (3.0 * T)
+
+        self.last_sg_stats = {
+            "sg1": self.lif1.last_width,
+            "sg2": self.lif2.last_width,
+            "sg3": self.lif3.last_width,
+        }
+        mem_out_rec = torch.stack(mem_out_rec)
+        mean_hidden_fr = fr_accum / (3.0 * T)
+        return mem_out_rec, mean_hidden_fr
 
     @torch.no_grad()
     def dspr_step(self, eta_net: float) -> None:
@@ -550,12 +710,18 @@ class ConvDSPRNet(nn.Module):
         self.zero_grad(set_to_none=True)
 
     def auxiliary_parameters(self):
-        dsp_names = {"conv1.z_pos", "conv1.z_neg", "conv2.z_pos", "conv2.z_neg",
-                     "fc1.z_pos", "fc1.z_neg", "fc2.z_pos", "fc2.z_neg"}
+        dsp_names = {
+            "conv1.z_pos", "conv1.z_neg", "conv2.z_pos", "conv2.z_neg",
+            "fc1.z_pos", "fc1.z_neg", "fc2.z_pos", "fc2.z_neg",
+        }
         for name, p in self.named_parameters():
             if name not in dsp_names:
                 yield p
 
+
+# ============================================================
+# Encoding / losses
+# ============================================================
 
 def encode_rate(x: torch.Tensor, T: int, rate_scale: float) -> torch.Tensor:
     p = torch.clamp(x * rate_scale, 0.0, 1.0)
@@ -570,14 +736,15 @@ def encode_latency(x: torch.Tensor, T: int, thr: float) -> torch.Tensor:
     spk = torch.zeros(B, flat.shape[1], T, device=x.device)
     spk.scatter_(2, t_spike.unsqueeze(-1), 1.0)
     spk = spk * mask.unsqueeze(-1).float()
-    return spk.permute(2, 0, 1).contiguous().view(T, B, C, H, W)
+    spk = spk.permute(2, 0, 1).contiguous()
+    return spk.view(T, B, C, H, W)
 
 
 def output_logits(mem_out_rec: torch.Tensor, mode: str) -> torch.Tensor:
-    if mode == "sum":
-        return mem_out_rec.sum(dim=0) / mem_out_rec.shape[0]
     if mode == "mean":
         return mem_out_rec.mean(dim=0)
+    if mode == "sum":
+        return mem_out_rec.sum(dim=0) / mem_out_rec.shape[0]
     if mode == "max":
         return mem_out_rec.max(dim=0).values
     if mode == "last":
@@ -590,45 +757,6 @@ def temporal_ce_loss(mem_out_rec: torch.Tensor, targets: torch.Tensor) -> torch.
     return torch.stack(losses).mean()
 
 
-def subset_dataset(ds, subset: int):
-    if subset is None or subset <= 0 or subset >= len(ds):
-        return ds
-    return torch.utils.data.Subset(ds, range(subset))
-
-
-def safe_collate(batch):
-    xs, ys = zip(*batch)
-
-    xs_out = []
-    for x in xs:
-        if isinstance(x, torch.Tensor):
-            xs_out.append(x)
-        else:
-            xs_out.append(TF.to_tensor(x))
-
-    ys_out = []
-    for y in ys:
-        if isinstance(y, torch.Tensor):
-            ys_out.append(int(y.item()))
-        else:
-            ys_out.append(int(y))
-
-    return torch.stack(xs_out, dim=0), torch.tensor(ys_out, dtype=torch.long)
-
-
-def make_loader(ds, batch_size: int, train: bool):
-    return DataLoader(
-        ds,
-        batch_size=batch_size,
-        shuffle=train,
-        drop_last=train,
-        num_workers=0,
-        pin_memory=False,
-        persistent_workers=False,
-        collate_fn=safe_collate,
-    )
-
-
 def eta_schedule(epoch: int, args) -> float:
     if args.eta_warmup_epochs <= 0:
         return args.eta_net
@@ -636,9 +764,15 @@ def eta_schedule(epoch: int, args) -> float:
     return float(args.eta_net) * alpha
 
 
+# ============================================================
+# Training / evaluation
+# ============================================================
+
 def train_one_epoch(model, loader, aux_opt, device, args, epoch: int):
     model.train()
-    total_loss = total_correct = total_n = 0.0
+    total_loss = 0.0
+    total_correct = 0
+    total_n = 0
     mean_hidden_fr = 0.0
     printed_debug = False
     eta_eff = eta_schedule(epoch, args)
@@ -646,18 +780,29 @@ def train_one_epoch(model, loader, aux_opt, device, args, epoch: int):
     for xb, yb in loader:
         xb = xb.to(device)
         yb = torch.as_tensor(yb, device=device, dtype=torch.long)
-        spk_in = encode_rate(xb, args.T, args.rate_scale) if args.encoding == "rate" else encode_latency(xb, args.T, args.latency_thr)
+
+        if args.encoding == "rate":
+            spk_in = encode_rate(xb, args.T, args.rate_scale)
+        else:
+            spk_in = encode_latency(xb, args.T, args.latency_thr)
+
         model.zero_all_grads()
         aux_opt.zero_grad(set_to_none=True)
         mem_out_rec, mean_fr = model(spk_in)
+
+        if not torch.isfinite(mem_out_rec).all():
+            raise RuntimeError("Non-finite output membrane detected in training.")
         logits = output_logits(mem_out_rec, args.mem_logits)
+        if not torch.isfinite(logits).all():
+            raise RuntimeError("Non-finite logits detected in training.")
+
         if not printed_debug:
             printed_debug = True
             print(f"[DEBUG] input firing rate: {float(spk_in.mean().item()):.4f}")
             print(f"[DEBUG] hidden firing rate: {float(mean_fr.item()):.4f}")
             print(f"[DEBUG] logits mean abs: {float(logits.abs().mean().item()):.4f}")
-        if not torch.isfinite(mem_out_rec).all() or not torch.isfinite(logits).all():
-            raise RuntimeError("Non-finite activations/logits detected in training.")
+            print(f"[DEBUG] SG widths: {model.last_sg_stats}")
+
         loss_readout = F.cross_entropy(logits, yb)
         loss_temporal = temporal_ce_loss(mem_out_rec, yb)
         loss = (1.0 - args.temporal_loss_weight) * loss_readout + args.temporal_loss_weight * loss_temporal
@@ -665,14 +810,18 @@ def train_one_epoch(model, loader, aux_opt, device, args, epoch: int):
             loss = loss + args.fr_lambda * (mean_fr - args.fr_target) ** 2
         if not torch.isfinite(loss):
             raise RuntimeError(f"Non-finite training loss detected: {loss}")
+
         loss.backward()
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(list(model.parameters()), args.grad_clip)
-        aux_opt.step()
-        model.dspr_step(eta_eff)
+
+        aux_opt.step()       # non-memristive support parameters
+        model.dspr_step(eta_eff)  # memristive synapses ONLY through DSPR
+
         batch_n = xb.size(0)
+        batch_correct = int((logits.argmax(dim=1) == yb).sum().item())
         total_loss += float(loss.item()) * batch_n
-        total_correct += int((logits.argmax(dim=1) == yb).sum().item())
+        total_correct += batch_correct
         total_n += batch_n
         mean_hidden_fr += float(mean_fr.item()) * batch_n
 
@@ -689,24 +838,32 @@ def train_one_epoch(model, loader, aux_opt, device, args, epoch: int):
 @torch.no_grad()
 def eval_one_epoch(model, loader, device, args):
     model.eval()
-    total_loss = total_correct = total_n = 0.0
+    total_loss = 0.0
+    total_correct = 0
+    total_n = 0
+
     for xb, yb in loader:
         xb = xb.to(device)
         yb = torch.as_tensor(yb, device=device, dtype=torch.long)
-        spk_in = encode_rate(xb, args.T, args.rate_scale) if args.encoding == "rate" else encode_latency(xb, args.T, args.latency_thr)
+        if args.encoding == "rate":
+            spk_in = encode_rate(xb, args.T, args.rate_scale)
+        else:
+            spk_in = encode_latency(xb, args.T, args.latency_thr)
+
         mem_out_rec, _ = model(spk_in)
+        if not torch.isfinite(mem_out_rec).all():
+            raise RuntimeError("Non-finite output membrane detected in evaluation.")
         logits = output_logits(mem_out_rec, args.mem_logits)
-        if not torch.isfinite(mem_out_rec).all() or not torch.isfinite(logits).all():
-            raise RuntimeError("Non-finite activations/logits detected in evaluation.")
+        if not torch.isfinite(logits).all():
+            raise RuntimeError("Non-finite logits detected in evaluation.")
+
         loss_readout = F.cross_entropy(logits, yb)
         loss_temporal = temporal_ce_loss(mem_out_rec, yb)
         loss = (1.0 - args.temporal_loss_weight) * loss_readout + args.temporal_loss_weight * loss_temporal
-        if not torch.isfinite(loss):
-            raise RuntimeError(f"Non-finite eval loss detected: {loss}")
-        batch_n = xb.size(0)
-        total_loss += float(loss.item()) * batch_n
+        total_loss += float(loss.item()) * xb.size(0)
         total_correct += int((logits.argmax(dim=1) == yb).sum().item())
-        total_n += batch_n
+        total_n += xb.size(0)
+
     avg_loss = float(total_loss) / float(max(total_n, 1))
     acc = float(total_correct) / float(max(total_n, 1))
     if not np.isfinite(avg_loss) or not np.isfinite(acc):
@@ -725,17 +882,33 @@ def train_dataset(dataset_name: str, dspr: DSPRParams, args):
     train_loader = make_loader(train_ds, args.batch_size, train=True)
     test_loader = make_loader(test_ds, args.batch_size, train=False)
 
-    model = ConvDSPRNet(n_out=n_out, dspr=dspr, beta_h=args.beta_h, thr_h=args.thr_h,
-                        spike_slope=args.spike_slope, beta_out=args.beta_out,
-                        syn_scale_conv1=args.syn_scale_conv1, syn_scale_conv2=args.syn_scale_conv2,
-                        syn_scale_fc1=args.syn_scale_fc1, syn_scale_fc2=args.syn_scale_fc2,
-                        wmax_conv1=args.wmax_conv1, wmax_conv2=args.wmax_conv2,
-                        wmax_fc1=args.wmax_fc1, wmax_fc2=args.wmax_fc2,
-                        reset_h=args.reset_h, init_mode=args.init_mode, init_spread=args.init_spread,
-                        history_lambda=args.history_lambda, tau_h=args.tau_h,
-                        history_increment=args.history_increment, noise_on=args.noise_on,
-                        leak_dt=args.leak_dt, delta_z_cap=args.delta_z_cap).to(device)
-    aux_opt = torch.optim.Adam(list(model.auxiliary_parameters()), lr=args.aux_lr, weight_decay=args.weight_decay)
+    model = ConvDSPRMPDNet(
+        n_out=n_out,
+        dspr=dspr,
+        beta_h=args.beta_h,
+        thr_h=args.thr_h,
+        beta_out=args.beta_out,
+        syn_scale_conv1=args.syn_scale_conv1,
+        syn_scale_conv2=args.syn_scale_conv2,
+        syn_scale_fc1=args.syn_scale_fc1,
+        syn_scale_fc2=args.syn_scale_fc2,
+        wmax_conv1=args.wmax_conv1,
+        wmax_conv2=args.wmax_conv2,
+        wmax_fc1=args.wmax_fc1,
+        wmax_fc2=args.wmax_fc2,
+        reset_h=args.reset_h,
+        init_mode=args.init_mode,
+        init_spread=args.init_spread,
+        history_lambda=args.history_lambda,
+        tau_h=args.tau_h,
+        history_increment=args.history_increment,
+        noise_on=args.noise_on,
+        leak_dt=args.leak_dt,
+        delta_z_cap=args.delta_z_cap,
+        kappa_scale=args.sg_kappa_scale,
+    ).to(device)
+
+    aux_opt = torch.optim.Adam(model.auxiliary_parameters(), lr=args.aux_lr, weight_decay=args.weight_decay)
 
     print(f"\n=== Dataset: {dataset_name} | device={device} ===")
     print(
@@ -747,29 +920,68 @@ def train_dataset(dataset_name: str, dspr: DSPRParams, args):
     best_acc = -1.0
     best_state = None
     history = []
+
     for epoch in range(1, args.epochs + 1):
         tr = train_one_epoch(model, train_loader, aux_opt, device, args, epoch)
         te = eval_one_epoch(model, test_loader, device, args)
-        history.append({"epoch": epoch, "eta_eff": tr["eta_eff"], "train_loss": tr["loss"],
-                        "train_acc": tr["acc"], "train_fr_hid": tr["fr_hid"],
-                        "test_loss": te["loss"], "test_acc": te["acc"]})
+
+        history.append({
+            "epoch": epoch,
+            "eta_eff": tr["eta_eff"],
+            "train_loss": tr["loss"],
+            "train_acc": tr["acc"],
+            "train_fr_hid": tr["fr_hid"],
+            "test_loss": te["loss"],
+            "test_acc": te["acc"],
+        })
+
         if te["acc"] > best_acc:
             best_acc = te["acc"]
-            best_state = {"conv1_z_pos": model.conv1.z_pos.detach().cpu(), "conv1_z_neg": model.conv1.z_neg.detach().cpu(),
-                          "conv2_z_pos": model.conv2.z_pos.detach().cpu(), "conv2_z_neg": model.conv2.z_neg.detach().cpu(),
-                          "fc1_z_pos": model.fc1.z_pos.detach().cpu(), "fc1_z_neg": model.fc1.z_neg.detach().cpu(),
-                          "fc2_z_pos": model.fc2.z_pos.detach().cpu(), "fc2_z_neg": model.fc2.z_neg.detach().cpu(),
-                          "bn1": model.bn1.state_dict(), "bn2": model.bn2.state_dict(), "bn3": model.bn3.state_dict(),
-                          "lif1_rho": model.lif1.rho.detach().cpu(), "lif2_rho": model.lif2.rho.detach().cpu(),
-                          "lif3_rho": model.lif3.rho.detach().cpu(), "li_out_rho": model.li_out.rho.detach().cpu()}
-        print(f"Epoch {epoch:02d} | eta_eff {tr['eta_eff']:.4e} | train loss {tr['loss']:.4f} acc {tr['acc']:.4f} fr_hid {tr['fr_hid']:.4f} | test loss {te['loss']:.4f} acc {te['acc']:.4f}")
+            best_state = {
+                "conv1_z_pos": model.conv1.z_pos.detach().cpu(),
+                "conv1_z_neg": model.conv1.z_neg.detach().cpu(),
+                "conv2_z_pos": model.conv2.z_pos.detach().cpu(),
+                "conv2_z_neg": model.conv2.z_neg.detach().cpu(),
+                "fc1_z_pos": model.fc1.z_pos.detach().cpu(),
+                "fc1_z_neg": model.fc1.z_neg.detach().cpu(),
+                "fc2_z_pos": model.fc2.z_pos.detach().cpu(),
+                "fc2_z_neg": model.fc2.z_neg.detach().cpu(),
+                "aux_state_dict": {
+                    "bn1": model.bn1.state_dict(),
+                    "bn2": model.bn2.state_dict(),
+                    "bn3": model.bn3.state_dict(),
+                    "lif1_rho": model.lif1.rho.detach().cpu(),
+                    "lif2_rho": model.lif2.rho.detach().cpu(),
+                    "lif3_rho": model.lif3.rho.detach().cpu(),
+                    "li_out_rho": model.li_out.rho.detach().cpu(),
+                }
+            }
 
-    save_path = f"{args.save_prefix}_{dataset_name.replace('-', '_')}_conv_dspr.pt"
-    torch.save({"dataset": dataset_name, "dspr": dspr.__dict__, "args": vars(args),
-                "best_acc": best_acc, "history": history, "best_state": best_state}, save_path)
+        print(
+            f"Epoch {epoch:02d} | eta_eff {tr['eta_eff']:.4e} | "
+            f"train loss {tr['loss']:.4f} acc {tr['acc']:.4f} fr_hid {tr['fr_hid']:.4f} | "
+            f"test loss {te['loss']:.4f} acc {te['acc']:.4f}"
+        )
+
+    save_path = f"{args.save_prefix}_{dataset_name.replace('-', '_')}_mpd_dspr.pt"
+    torch.save(
+        {
+            "dataset": dataset_name,
+            "dspr": dspr.__dict__,
+            "args": vars(args),
+            "best_acc": best_acc,
+            "history": history,
+            "best_state": best_state,
+        },
+        save_path,
+    )
     print(f"Saved best checkpoint to {save_path}")
     return best_acc, save_path
 
+
+# ============================================================
+# Optional topology comparison
+# ============================================================
 
 def load_raw_tsv(tsv_path: str) -> pd.DataFrame:
     df = pd.read_csv(tsv_path, sep="\t", engine="python")
@@ -806,16 +1018,23 @@ def compare_topologies(paths: Dict[str, str], v_prog: float = 5.0):
             print(f"{name}: no high pulses found")
             continue
         mean_last = end_i[-10:].mean() if end_i.size >= 10 else end_i.mean()
-        print(f"{name}: pulses={end_i.size}, first={end_i[0]:.4e} A, last={end_i[-1]:.4e} A, mean_last10={mean_last:.4e} A")
+        print(
+            f"{name}: pulses={end_i.size}, first={end_i[0]:.4e} A, "
+            f"last={end_i[-1]:.4e} A, mean_last10={mean_last:.4e} A"
+        )
 
+
+# ============================================================
+# CLI / main
+# ============================================================
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="DSPR-constrained convolutional SNN on harder MNIST-family datasets")
+    ap = argparse.ArgumentParser(description="Conv SNN with MPD-aligned surrogate gradient and DSPR synapses")
     ap.add_argument("--protocol_xlsx", type=str, required=True)
     ap.add_argument("--sheet_name", default="0")
-    ap.add_argument("--datasets", type=str, default="FashionMNIST,EMNIST-Balanced,EMNIST-Letters")
+    ap.add_argument("--datasets", type=str, default="FashionMNIST")
     ap.add_argument("--data_dir", type=str, default="./data")
-    ap.add_argument("--epochs", type=int, default=25)
+    ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--batch_size", type=int, default=128)
     ap.add_argument("--train_subset", type=int, default=0)
     ap.add_argument("--test_subset", type=int, default=0)
@@ -827,20 +1046,21 @@ def parse_args():
     ap.add_argument("--rate_scale", type=float, default=0.20)
     ap.add_argument("--latency_thr", type=float, default=0.15)
     ap.add_argument("--mem_logits", type=str, default="mean", choices=["sum", "mean", "max", "last"])
-    ap.add_argument("--temporal_loss_weight", type=float, default=0.20)
+    ap.add_argument("--temporal_loss_weight", type=float, default=0.15)
+
     ap.add_argument("--aux_lr", type=float, default=1e-3)
     ap.add_argument("--weight_decay", type=float, default=1e-5)
 
     ap.add_argument("--beta_h", type=float, default=0.90)
-    ap.add_argument("--thr_h", type=float, default=0.60)
+    ap.add_argument("--thr_h", type=float, default=0.65)
     ap.add_argument("--reset_h", type=str, default="subtract", choices=["subtract", "zero", "none"])
-    ap.add_argument("--spike_slope", type=float, default=10.0)
     ap.add_argument("--beta_out", type=float, default=0.92)
+    ap.add_argument("--sg_kappa_scale", type=float, default=1.0)
 
-    ap.add_argument("--syn_scale_conv1", type=float, default=0.80)
-    ap.add_argument("--syn_scale_conv2", type=float, default=0.60)
-    ap.add_argument("--syn_scale_fc1", type=float, default=0.40)
-    ap.add_argument("--syn_scale_fc2", type=float, default=0.35)
+    ap.add_argument("--syn_scale_conv1", type=float, default=0.60)
+    ap.add_argument("--syn_scale_conv2", type=float, default=0.45)
+    ap.add_argument("--syn_scale_fc1", type=float, default=0.28)
+    ap.add_argument("--syn_scale_fc2", type=float, default=0.18)
 
     ap.add_argument("--eta_net", type=float, default=3e-3)
     ap.add_argument("--eta_warmup_epochs", type=int, default=5)
@@ -858,8 +1078,8 @@ def parse_args():
     ap.add_argument("--tau_h", type=float, default=1.0)
     ap.add_argument("--history_increment", type=float, default=1.0)
 
-    ap.add_argument("--fr_lambda", type=float, default=1.0)
-    ap.add_argument("--fr_target", type=float, default=0.05)
+    ap.add_argument("--fr_lambda", type=float, default=1.5)
+    ap.add_argument("--fr_target", type=float, default=0.10)
     ap.add_argument("--grad_clip", type=float, default=1.0)
 
     ap.add_argument("--raw_1m", type=str, default=None)
@@ -873,8 +1093,10 @@ def parse_args():
 def main():
     args = parse_args()
     set_seed(args.seed)
+
     if args.device == "auto" and torch.backends.mps.is_available():
         print("[INFO] MPS detected. If you see impossible metrics, rerun with --device cpu.")
+
     sheet_name = parse_sheet_name(args.sheet_name)
     dspr, segments = fit_dspr_from_xlsx(args.protocol_xlsx, sheet_name=sheet_name)
     print("Fitted DSPR parameters from protocol file:")
